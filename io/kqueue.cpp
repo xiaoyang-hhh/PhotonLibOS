@@ -20,6 +20,7 @@ limitations under the License.
 #include <vector>
 #include <sys/event.h>
 #include <photon/common/alog.h>
+#include <photon/thread/thread.h>
 #include "events_map.h"
 #include "reset_handle.h"
 
@@ -96,6 +97,7 @@ public:
         auto current = CURRENT;
         int ret = enqueue(fd, ev, EV_ADD | EV_ONESHOT, 0, current);
         if (ret < 0) return ret;
+        SCOPED_PAUSE_WORK_STEALING;
         ret = thread_usleep(timeout);
         ERRNO err;
         if (ret == -1 && err.no == EOK) {
