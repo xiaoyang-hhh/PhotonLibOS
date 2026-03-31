@@ -750,10 +750,12 @@ TEST(CachePool, test_hot_lru_limit) {
   auto cacheAllocator = new AlignedAlloc(4 * 1024);
   auto roCachedFs = new_full_file_cached_fs(nullptr, alignFs, 1024 * 1024,
       1, 1000 * 1000 * 1, 128ul * 1024 * 1024, cacheAllocator, 0);
-  auto pool = roCachedFs->get_pool();
+  auto cachePool = roCachedFs->get_pool();
   DEFER({ delete cacheAllocator; delete roCachedFs; });
   using T = FileCachePoolTest;
 
+  auto pool = dynamic_cast<FileCachePool*>(cachePool);
+  ASSERT_NE(nullptr, pool);
   T::set_hot_lru_limit(pool, hotLimit);
 
   for (size_t i = 0; i < fileNum; i++) {
@@ -804,13 +806,16 @@ TEST(CachePool, evict_cold_file) {
   const size_t fileNum = 100;
 
   auto mediaFs = new_localfs_adaptor(root.c_str(), ioengine_libaio);
+  auto alignFs = new_aligned_fs_adaptor(mediaFs, 4 * 1024, true, true);
   auto cacheAllocator = new AlignedAlloc(4 * 1024);
   auto roCachedFs = new_full_file_cached_fs(nullptr, alignFs, 1024 * 1024,
       1, 1000 * 1000 * 1, 128ul * 1024 * 1024, cacheAllocator, 0);
-  auto pool = roCachedFs->get_pool();
+  auto cachePool = roCachedFs->get_pool();
   DEFER({ delete cacheAllocator; delete roCachedFs; });
   using T = FileCachePoolTest;
 
+  auto pool = dynamic_cast<FileCachePool*>(cachePool);
+  ASSERT_NE(nullptr, pool);
   T::set_hot_lru_limit(pool, hotLimit);
 
   for (size_t i = 0; i < fileNum; i++) {
