@@ -750,11 +750,11 @@ TEST(CachePool, test_hot_lru_limit) {
   auto cacheAllocator = new AlignedAlloc(4 * 1024);
   auto roCachedFs = new_full_file_cached_fs(nullptr, alignFs, 1024 * 1024,
       1, 1000 * 1000 * 1, 128ul * 1024 * 1024, cacheAllocator, 0);
-  auto cachePool = roCachedFs->get_pool();
+  auto pool = roCachedFs->get_pool();
   DEFER({ delete cacheAllocator; delete roCachedFs; });
   using T = FileCachePoolTest;
 
-  T::set_hot_lru_limit(cachePool, hotLimit);
+  T::set_hot_lru_limit(pool, hotLimit);
 
   for (size_t i = 0; i < fileNum; i++) {
     std::string name = "/f" + std::to_string(i);
@@ -807,11 +807,11 @@ TEST(CachePool, evict_cold_file) {
   auto cacheAllocator = new AlignedAlloc(4 * 1024);
   auto roCachedFs = new_full_file_cached_fs(nullptr, alignFs, 1024 * 1024,
       1, 1000 * 1000 * 1, 128ul * 1024 * 1024, cacheAllocator, 0);
-  auto cachePool = roCachedFs->get_pool();
+  auto pool = roCachedFs->get_pool();
   DEFER({ delete cacheAllocator; delete roCachedFs; });
   using T = FileCachePoolTest;
 
-  T::set_hot_lru_limit(cachePool, hotLimit);
+  T::set_hot_lru_limit(pool, hotLimit);
 
   for (size_t i = 0; i < fileNum; i++) {
     std::string name = "/f" + std::to_string(i);
