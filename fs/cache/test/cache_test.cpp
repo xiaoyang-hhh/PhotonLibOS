@@ -759,11 +759,11 @@ TEST(CachePool, test_hot_lru_limit) {
   T::set_hot_lru_limit(pool, hotLimit);
 
   for (size_t i = 0; i < fileNum; i++) {
+    photon::thread_usleep(100);
     std::string name = "/f" + std::to_string(i);
     ASSERT_TRUE(openClose(pool, name.c_str()));
   }
 
-  photon::thread_sleep(1);
   EXPECT_LE(T::hot_size(pool), hotLimit);
   EXPECT_EQ(T::hot_size(pool) + T::cold_size(pool), fileNum);
 
@@ -819,6 +819,7 @@ TEST(CachePool, evict_cold_file) {
   T::set_hot_lru_limit(pool, hotLimit);
 
   for (size_t i = 0; i < fileNum; i++) {
+    photon::thread_usleep(100);
     std::string name = "/f" + std::to_string(i);
     ASSERT_TRUE(openClose(pool, name.c_str()));
   }
