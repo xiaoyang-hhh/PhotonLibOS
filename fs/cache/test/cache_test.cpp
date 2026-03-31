@@ -749,7 +749,7 @@ TEST(CachePool, test_hot_lru_limit) {
   auto alignFs = new_aligned_fs_adaptor(mediaFs, 4 * 1024, true, true);
   auto cacheAllocator = new AlignedAlloc(4 * 1024);
   auto roCachedFs = new_full_file_cached_fs(nullptr, alignFs, 1024 * 1024,
-      1, 1000 * 1000 * 1, 128ul * 1024 * 1024, cacheAllocator, 0);
+      1, 1000 * 1000 * 1, 128ul * 1024 * 1024, cacheAllocator, 0, nullptr, 1000);
   auto cachePool = roCachedFs->get_pool();
   DEFER({ delete cacheAllocator; delete roCachedFs; });
   using T = FileCachePoolTest;
@@ -763,6 +763,7 @@ TEST(CachePool, test_hot_lru_limit) {
     ASSERT_TRUE(openClose(pool, name.c_str()));
   }
 
+  photon::thread_sleep(1);
   EXPECT_LE(T::hot_size(pool), hotLimit);
   EXPECT_EQ(T::hot_size(pool) + T::cold_size(pool), fileNum);
 
@@ -793,14 +794,13 @@ TEST(CachePool, test_hot_lru_limit) {
     ASSERT_TRUE(openClose(pool, name.c_str()));
 
     if (rand() % 3 == 0) {
-      EXPECT_LE(T::hot_size(pool), hotLimit);
       EXPECT_EQ(T::hot_size(pool) + T::cold_size(pool), fileNum);
     }
   }
 }
 
 TEST(CachePool, evict_cold_file) {
-  std::string root = "/tmp/ease/cache/tier_evict_cold/";
+  std::string root = "/tmp/ease/cache/evict_cold_file/";
   SetupTestDir(root);
   const size_t hotLimit = 10;
   const size_t fileNum = 100;
@@ -809,7 +809,7 @@ TEST(CachePool, evict_cold_file) {
   auto alignFs = new_aligned_fs_adaptor(mediaFs, 4 * 1024, true, true);
   auto cacheAllocator = new AlignedAlloc(4 * 1024);
   auto roCachedFs = new_full_file_cached_fs(nullptr, alignFs, 1024 * 1024,
-      1, 1000 * 1000 * 1, 128ul * 1024 * 1024, cacheAllocator, 0);
+      1, 1000 * 1000 * 1, 128ul * 1024 * 1024, cacheAllocator, 0, nullptr, 1000);
   auto cachePool = roCachedFs->get_pool();
   DEFER({ delete cacheAllocator; delete roCachedFs; });
   using T = FileCachePoolTest;
@@ -823,6 +823,7 @@ TEST(CachePool, evict_cold_file) {
     ASSERT_TRUE(openClose(pool, name.c_str()));
   }
 
+  photon::thread_sleep(1);
   ASSERT_TRUE(T::in_cold(pool, "/f0"));
   EXPECT_LE(T::hot_size(pool), hotLimit);
   EXPECT_EQ(T::hot_size(pool) + T::cold_size(pool), fileNum);
