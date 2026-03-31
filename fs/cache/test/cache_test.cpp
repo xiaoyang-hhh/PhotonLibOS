@@ -33,7 +33,8 @@ limitations under the License.
 #include <photon/thread/thread.h>
 #include <photon/common/io-alloc.h>
 #include <photon/fs/cache/cache.h>
-#include <photon/fs/cache/full_file_cache/cache_pool.h>
+
+#include "../full_file_cache/cache_pool.h"
 #include "random_generator.h"
 
 namespace photon {
@@ -716,15 +717,17 @@ TEST(CachePool, open_same_file) {
 }
 
 // Friend accessor — declared as friend in FileCachePool.
-// Provides read-only inspection of internal state for test assertions.
 struct FileCachePoolTest {
+  static void set_hot_lru_limit(FileCachePool *p, uint32_t limit) {
+    p->hotLruLimit_ = limit;
+  }
   static size_t hot_size (FileCachePool *p) { return p->lru_.size(); }
   static size_t cold_size(FileCachePool *p) { return p->cold_.size(); }
   static bool in_hot (FileCachePool *p, std::string_view n) {
-      return p->fileIndex_.find(n) != p->fileIndex_.end();
+    return p->fileIndex_.find(n) != p->fileIndex_.end();
   }
   static bool in_cold(FileCachePool *p, std::string_view n) {
-      return p->coldIndex_.find(n) != p->coldIndex_.end();
+    return p->coldIndex_.find(n) != p->coldIndex_.end();
   }
 };
 
@@ -743,10 +746,15 @@ TEST(CachePool, test_hot_lru_limit) {
   const size_t fileNum = 100;
 
   auto mediaFs = new_localfs_adaptor(root.c_str(), ioengine_libaio);
-  auto pool = new FileCachePool(mediaFs, 1, 0, 0, 4096, 10'000'000, hotLimit);
-  pool->Init();
-  DEFER(delete pool);
+  auto alignFs = new_aligned_fs_adaptor(mediaFs, 4 * 1024, true, true);
+  auto cacheAllocator = new AlignedAlloc(4 * 1024);
+  auto roCachedFs = new_full_file_cached_fs(nullptr, alignFs, 1024 * 1024,
+      1, 1000 * 1000 * 1, 128ul * 1024 * 1024, cacheAllocator, 0);
+  auto cachePool = roCachedFs->get_pool();
+  DEFER({ delete cacheAllocator; delete roCachedFs; });
   using T = FileCachePoolTest;
+
+  T::set_hot_lru_limit(cachePool, hotLimit);
 
   for (size_t i = 0; i < fileNum; i++) {
     std::string name = "/f" + std::to_string(i);
@@ -796,10 +804,14 @@ TEST(CachePool, evict_cold_file) {
   const size_t fileNum = 100;
 
   auto mediaFs = new_localfs_adaptor(root.c_str(), ioengine_libaio);
-  auto pool = new FileCachePool(mediaFs, 1, 0, 0, 4096, 10'000'000, hotLimit);
-  pool->Init();
-  DEFER(delete pool);
+  auto cacheAllocator = new AlignedAlloc(4 * 1024);
+  auto roCachedFs = new_full_file_cached_fs(nullptr, alignFs, 1024 * 1024,
+      1, 1000 * 1000 * 1, 128ul * 1024 * 1024, cacheAllocator, 0);
+  auto cachePool = roCachedFs->get_pool();
+  DEFER({ delete cacheAllocator; delete roCachedFs; });
   using T = FileCachePoolTest;
+
+  T::set_hot_lru_limit(cachePool, hotLimit);
 
   for (size_t i = 0; i < fileNum; i++) {
     std::string name = "/f" + std::to_string(i);

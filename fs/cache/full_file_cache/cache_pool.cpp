@@ -38,7 +38,7 @@ const int64_t kEvictionMark = 5ll * kGB;
 
 FileCachePool::FileCachePool(IFileSystem* mediaFs, uint64_t capacityInGB,
     uint64_t periodInUs, uint64_t diskAvailInBytes, uint64_t refillUnit,
-    uint64_t storeCacheTTLUsecs, uint32_t hotLruLimit)
+    uint64_t storeCacheTTLUsecs)
     : ICachePool(0, 128, -1U, false, storeCacheTTLUsecs),
       mediaFs_(mediaFs),
       capacityInGB_(capacityInGB),
@@ -49,8 +49,7 @@ FileCachePool::FileCachePool(IFileSystem* mediaFs, uint64_t capacityInGB,
       timer_(nullptr),
       running_(false),
       exit_(false),
-      isFull_(false),
-      hotLruLimit_(hotLruLimit) {
+      isFull_(false) {
     int64_t capacityInBytes = capacityInGB_ * kGB;
     waterMark_ = calcWaterMark(capacityInBytes, kMaxFreeSpace);
     // keep this relation : waterMark < riskMark < capacity
@@ -368,8 +367,8 @@ void FileCachePool::demoteToCold(FileNameMap::iterator iter) {
   auto lruEntry = iter->second.get();
 
   uint32_t idx = static_cast<uint32_t>(cold_.size());
-  auto [nodeIt, _] = coldIndex_.emplace(iter->first, idx);
-  cold_.emplace_back(nodeIt, lruEntry->size);
+  auto nodeIt = coldIndex_.emplace(iter->first, idx);
+  cold_.emplace_back(nodeIt.first, lruEntry->size);
 
   lru_.remove(lruEntry->lruIter);
   fileIndex_.erase(iter);

@@ -36,8 +36,7 @@ class FileCachePool : public photon::fs::ICachePool {
 public:
     FileCachePool(photon::fs::IFileSystem *mediaFs, uint64_t capacityInGB, uint64_t periodInUs,
                   uint64_t diskAvailInBytes, uint64_t refillUnit,
-                  uint64_t storeCacheTTLUsecs = 10'000'000,
-                  uint32_t hotLruLimit = kDefaultHotLruLimit);
+                  uint64_t storeCacheTTLUsecs = 10'000'000);
     ~FileCachePool();
 
     static const uint64_t kDiskBlockSize = 512; // stat(2)
@@ -113,7 +112,7 @@ protected:
     // filename -> lruEntry
     FileNameMap fileIndex_;
 
-    uint32_t hotLruLimit_;
+    uint32_t hotLruLimit_ = kDefaultHotLruLimit;
 
     // If hotLruLimit_ is reached, files are demoted to cold container.
     using ColdIndexMap = unordered_map_string_key<uint32_t>;
