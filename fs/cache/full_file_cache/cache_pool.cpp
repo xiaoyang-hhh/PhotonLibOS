@@ -38,7 +38,7 @@ const int64_t kEvictionMark = 5ll * kGB;
 
 FileCachePool::FileCachePool(IFileSystem* mediaFs, uint64_t capacityInGB,
     uint64_t periodInUs, uint64_t diskAvailInBytes, uint64_t refillUnit,
-    uint64_t storeCacheTTLUsecs)
+    uint64_t storeCacheTTLUsecs, uint32_t hotLruLimit)
     : ICachePool(0, 128, -1U, false, storeCacheTTLUsecs),
       mediaFs_(mediaFs),
       capacityInGB_(capacityInGB),
@@ -49,7 +49,8 @@ FileCachePool::FileCachePool(IFileSystem* mediaFs, uint64_t capacityInGB,
       timer_(nullptr),
       running_(false),
       exit_(false),
-      isFull_(false) {
+      isFull_(false),
+      hotLruLimit_(hotLruLimit) {
     int64_t capacityInBytes = capacityInGB_ * kGB;
     waterMark_ = calcWaterMark(capacityInBytes, kMaxFreeSpace);
     // keep this relation : waterMark < riskMark < capacity
@@ -79,6 +80,12 @@ ICacheStore* FileCachePool::do_open(std::string_view pathname, int flags, mode_t
     return nullptr;
   }
 
+  // Check cold container first
+  auto coldIt = coldIndex_.find(pathname);
+  if (coldIt != coldIndex_.end()) {
+    promoteToHot(coldIt);
+  }
+
   auto find = fileIndex_.find(pathname);
   if (find == fileIndex_.end()) {
     auto lruIter = lru_.push_front(fileIndex_.end());
@@ -88,6 +95,16 @@ ICacheStore* FileCachePool::do_open(std::string_view pathname, int flags, mode_t
   } else {
     lru_.access(find->second->lruIter);
     find->second->openCount++;
+  }
+
+  // If hot LRU exceeds the limit, demote the LRU tail (only if not open) to cold
+  while (lru_.size() > hotLruLimit_) {
+    auto tailIter = lru_.back();
+    if (tailIter->second->openCount == 0) {
+      demoteToCold(tailIter);
+    } else {
+      break;
+    }
   }
 
   return new FileCacheStore(this, localFile, refillUnit_, find);
@@ -123,6 +140,12 @@ int FileCachePool::stat(CacheStat* stat, std::string_view pathname) {
 }
 
 int FileCachePool::evict(std::string_view filename) {
+  // Check cold container first — cold files are not in fileIndex_
+  auto coldIt = coldIndex_.find(filename);
+  if (coldIt != coldIndex_.end()) {
+    return evictColdEntry(coldIt->second) ? 0 : -1;
+  }
+
   auto fileIter = fileIndex_.find(filename);
   if (fileIter == fileIndex_.end()) {
     LOG_ERROR("Evict no such file , name: `", filename);
@@ -240,6 +263,17 @@ void FileCachePool::eviction() {
 
   isFull_ = true;
 
+  // Phase 1: randomly evict from cold tier first
+  while (actualEvict > 0 && !cold_.empty() && !exit_) {
+    // Pick a random index for O(1) swap-remove
+    uint32_t coldIdx = static_cast<uint32_t>(rand()) % cold_.size();
+    auto fileSize = cold_[coldIdx].size;
+    evictColdEntry(coldIdx);
+    actualEvict -= static_cast<int64_t>(fileSize);
+    photon::thread_yield();
+  }
+
+  // Phase 2: fall back to hot LRU eviction when cold tier is exhausted
   while (actualEvict > 0 && !lru_.empty() && !exit_) {
     auto fileIter = lru_.back();
     const auto& fileName = fileIter->first;
@@ -327,6 +361,69 @@ int FileCachePool::insertFile(std::string_view file) {
   lru_.front() = iter;
   totalUsed_ += fileSize;
   return 0;
+}
+
+// Demote a hot-LRU entry (openCount must be 0) to the cold container.
+void FileCachePool::demoteToCold(FileNameMap::iterator iter) {
+  auto lruEntry = iter->second.get();
+
+  uint32_t idx = static_cast<uint32_t>(cold_.size());
+  auto [nodeIt, _] = coldIndex_.emplace(iter->first, idx);
+  cold_.emplace_back(nodeIt, lruEntry->size);
+
+  lru_.remove(lruEntry->lruIter);
+  fileIndex_.erase(iter);
+}
+
+// Promote a cold entry back to the front of hot LRU.
+void FileCachePool::promoteToHot(ColdIndexMap::iterator iter) {
+  uint32_t idx = iter->second;
+  uint64_t size = cold_[idx].size;
+  std::string_view filename = iter->first;
+
+  // Re-insert into fileIndex_ and lru_ with openCount=0 (caller increments)
+  auto lruIter = lru_.push_front(fileIndex_.end());
+  std::unique_ptr<LruEntry> entry(new LruEntry{lruIter, 0, size});
+  auto newIter = fileIndex_.emplace(filename, std::move(entry)).first;
+  lru_.front() = newIter;
+
+  removeColdEntry(idx);
+}
+
+// Evict the cold entry at coldIndex.
+bool FileCachePool::evictColdEntry(uint32_t coldIndex) {
+  std::string_view filename = cold_[coldIndex].iter->first;
+  uint64_t fileSize = cold_[coldIndex].size;
+
+  DEFER(removeColdEntry(coldIndex));
+
+  if (fileSize > 0) {
+    totalUsed_ -= static_cast<int64_t>(fileSize);
+    if (totalUsed_ < 0) totalUsed_ = 0;
+    int err = mediaFs_->truncate(filename.data(), 0);
+    if (err) {
+      ERRNO e;
+      LOG_ERROR("truncate(0) failed (cold), name : `, error code : `", filename, e);
+    }
+  }
+  int err = mediaFs_->unlink(filename.data());
+  if (err) {
+    ERRNO e;
+    LOG_ERROR("unlink failed (cold), name : `, error code : `", filename, e);
+  }
+  return err == 0;
+}
+
+// Remove the cold entry at coldIndex via swap-remove.
+void FileCachePool::removeColdEntry(uint32_t coldIndex) {
+  auto nodeIt = cold_[coldIndex].iter;
+  coldIndex_.erase(nodeIt);
+  // swap-remove
+  if (coldIndex + 1 < cold_.size()) {
+    cold_[coldIndex] = cold_.back();
+    cold_[coldIndex].iter->second = coldIndex;
+  }
+  cold_.pop_back();
 }
 
 }

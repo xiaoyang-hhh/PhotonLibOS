@@ -33,6 +33,7 @@ limitations under the License.
 #include <photon/thread/thread.h>
 #include <photon/common/io-alloc.h>
 #include <photon/fs/cache/cache.h>
+#include <photon/fs/cache/full_file_cache/cache_pool.h>
 #include "random_generator.h"
 
 namespace photon {
@@ -711,6 +712,130 @@ TEST(CachePool, open_same_file) {
         cacheStore->release();
       }
     }
+  }
+}
+
+// Friend accessor — declared as friend in FileCachePool.
+// Provides read-only inspection of internal state for test assertions.
+struct FileCachePoolTest {
+  static size_t hot_size (FileCachePool *p) { return p->lru_.size(); }
+  static size_t cold_size(FileCachePool *p) { return p->cold_.size(); }
+  static bool in_hot (FileCachePool *p, std::string_view n) {
+      return p->fileIndex_.find(n) != p->fileIndex_.end();
+  }
+  static bool in_cold(FileCachePool *p, std::string_view n) {
+      return p->coldIndex_.find(n) != p->coldIndex_.end();
+  }
+};
+
+// Open through the pool then immediately release.
+static bool openClose(ICachePool* pool, const char* name) {
+  auto s = pool->open(name, O_CREAT | O_RDWR, 0644);
+  bool success = (s != nullptr);
+  if (s) s->release();
+  return success;
+}
+
+TEST(CachePool, test_hot_lru_limit) {
+  std::string root = "/tmp/ease/cache/test_hot_lru_limit/";
+  SetupTestDir(root);
+  const size_t hotLimit = 10;
+  const size_t fileNum = 100;
+
+  auto mediaFs = new_localfs_adaptor(root.c_str(), ioengine_libaio);
+  auto pool = new FileCachePool(mediaFs, 1, 0, 0, 4096, 10'000'000, hotLimit);
+  pool->Init();
+  DEFER(delete pool);
+  using T = FileCachePoolTest;
+
+  for (size_t i = 0; i < fileNum; i++) {
+    std::string name = "/f" + std::to_string(i);
+    ASSERT_TRUE(openClose(pool, name.c_str()));
+  }
+
+  EXPECT_LE(T::hot_size(pool), hotLimit);
+  EXPECT_EQ(T::hot_size(pool) + T::cold_size(pool), fileNum);
+
+  // first fileNum-hotLimit files are in cold
+  for (size_t i = 0; i < fileNum - hotLimit; i++) {
+    std::string name = "/f" + std::to_string(i);
+    EXPECT_TRUE(T::in_cold(pool, name));
+    EXPECT_FALSE(T::in_hot(pool, name));
+  }
+  // last hotLimit files are in hot
+  for (size_t i = fileNum - hotLimit; i < fileNum; i++) {
+    std::string name = "/f" + std::to_string(i);
+    EXPECT_TRUE(T::in_hot(pool, name));
+    EXPECT_FALSE(T::in_cold(pool, name));
+  }
+  // re-open /f0 — must promote to hot
+  ASSERT_TRUE(openClose(pool, "/f0"));
+  EXPECT_TRUE(T::in_hot(pool, "/f0"));
+  EXPECT_FALSE(T::in_cold(pool, "/f0"));
+
+  EXPECT_LE(T::hot_size(pool), hotLimit);
+  EXPECT_EQ(T::hot_size(pool) + T::cold_size(pool), fileNum);
+
+  // random access
+  for (size_t i = 0; i < 100; i++) {
+    int r = rand() % fileNum;
+    std::string name = "/f" + std::to_string(r);
+    ASSERT_TRUE(openClose(pool, name.c_str()));
+
+    if (rand() % 3 == 0) {
+      EXPECT_LE(T::hot_size(pool), hotLimit);
+      EXPECT_EQ(T::hot_size(pool) + T::cold_size(pool), fileNum);
+    }
+  }
+}
+
+TEST(CachePool, evict_cold_file) {
+  std::string root = "/tmp/ease/cache/tier_evict_cold/";
+  SetupTestDir(root);
+  const size_t hotLimit = 10;
+  const size_t fileNum = 100;
+
+  auto mediaFs = new_localfs_adaptor(root.c_str(), ioengine_libaio);
+  auto pool = new FileCachePool(mediaFs, 1, 0, 0, 4096, 10'000'000, hotLimit);
+  pool->Init();
+  DEFER(delete pool);
+  using T = FileCachePoolTest;
+
+  for (size_t i = 0; i < fileNum; i++) {
+    std::string name = "/f" + std::to_string(i);
+    ASSERT_TRUE(openClose(pool, name.c_str()));
+  }
+
+  ASSERT_TRUE(T::in_cold(pool, "/f0"));
+  EXPECT_LE(T::hot_size(pool), hotLimit);
+  EXPECT_EQ(T::hot_size(pool) + T::cold_size(pool), fileNum);
+
+  EXPECT_EQ(0, pool->evict("/f0"));
+  EXPECT_FALSE(T::in_cold(pool, "/f0"));
+  EXPECT_FALSE(T::in_hot(pool, "/f0"));
+  EXPECT_EQ(T::hot_size(pool), hotLimit);
+  EXPECT_EQ(T::hot_size(pool) + T::cold_size(pool), fileNum - 1);
+
+  std::vector<bool> evicted(fileNum, false);
+  evicted[0] = true;
+  for (size_t i = 0; i < 9; i++) {
+    int index = rand() % fileNum;
+    while (evicted[index]) {
+      index = rand() % fileNum;
+    }
+    std::string name = "/f" + std::to_string(index);
+    EXPECT_EQ(0, pool->evict(name));
+    evicted[index] = true;
+    EXPECT_FALSE(T::in_cold(pool, name));
+    EXPECT_FALSE(T::in_hot(pool, name));
+    EXPECT_LE(T::hot_size(pool), hotLimit);
+    EXPECT_EQ(T::hot_size(pool) + T::cold_size(pool), fileNum - 2 - i);
+  }
+
+  for (size_t i = 0; i < fileNum; i++) {
+    std::string name = "/f" + std::to_string(i);
+    bool existed = T::in_cold(pool, name) || T::in_hot(pool, name);
+    EXPECT_EQ(existed, !evicted[i]);
   }
 }
 
