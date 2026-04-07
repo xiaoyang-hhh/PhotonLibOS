@@ -139,10 +139,10 @@ int FileCachePool::stat(CacheStat* stat, std::string_view pathname) {
 }
 
 int FileCachePool::evict(std::string_view filename) {
-  // Check cold container first — cold files are not in fileIndex_
+  // Check cold container first
   auto coldIt = coldIndex_.find(filename);
   if (coldIt != coldIndex_.end()) {
-    return evictColdEntry(coldIt->second) ? 0 : -1;
+    return evictColdByIndex(coldIt->second) >= 0 ? 0 : -1;
   }
 
   auto fileIter = fileIndex_.find(filename);
@@ -157,9 +157,9 @@ int FileCachePool::evict(std::string_view filename) {
     lru_.mark_key_cleared(lruEntry->lruIter);
   }
   int err = 0;
-  auto cacheStore = static_cast<FileCacheStore*>(open(filePath, O_RDWR, 0644));
-  DEFER(cacheStore->release());
   {
+    auto cacheStore = static_cast<FileCacheStore*>(open(filePath, O_RDWR, 0644));
+    DEFER(cacheStore->release());
     photon::scoped_rwlock rl(cacheStore->rw_lock(), photon::WLOCK);
     err = mediaFs_->truncate(filePath.data(), 0);
     lruEntry->truncate_done = false;
@@ -262,15 +262,8 @@ void FileCachePool::eviction() {
 
   isFull_ = true;
 
-  // Phase 1: randomly evict from cold tier first
-  while (actualEvict > 0 && !cold_.empty() && !exit_) {
-    // Pick a random index for O(1) swap-remove
-    uint32_t coldIdx = static_cast<uint32_t>(rand()) % cold_.size();
-    auto fileSize = cold_[coldIdx].size;
-    evictColdEntry(coldIdx);
-    actualEvict -= static_cast<int64_t>(fileSize);
-    photon::thread_yield();
-  }
+  // Phase 1: evict from cold tier first.
+  actualEvict -= evictColdWhenFull(actualEvict);
 
   // Phase 2: fall back to hot LRU eviction when cold tier is exhausted
   while (actualEvict > 0 && !lru_.empty() && !exit_) {
@@ -291,9 +284,9 @@ void FileCachePool::eviction() {
         continue;
     }
 
-    auto cacheStore = static_cast<FileCacheStore*>(open(fileName, O_RDWR, 0644));
-    DEFER(cacheStore->release());
     {
+      auto cacheStore = static_cast<FileCacheStore*>(open(fileName, O_RDWR, 0644));
+      DEFER(cacheStore->release());
       photon::scoped_rwlock rl(cacheStore->rw_lock(), photon::WLOCK);
       err = mediaFs_->truncate(fileName.data(), 0);
       lruEntry->truncate_done = false;
@@ -332,9 +325,9 @@ bool FileCachePool::afterFtrucate(FileNameMap::iterator iter) {
       if (err && (e.no == EBUSY)) {
         return false;
       }
-      lru_.remove(iter->second->lruIter);
-      fileIndex_.erase(iter);
     }
+    lru_.remove(iter->second->lruIter);
+    fileIndex_.erase(iter);
   }
   return true;
 }
@@ -354,10 +347,16 @@ int FileCachePool::insertFile(std::string_view file) {
   }
   auto fileSize = st.st_blocks * kDiskBlockSize;
 
-  auto lruIter = lru_.push_front(fileIndex_.end());
-  auto entry = std::unique_ptr<LruEntry>(new LruEntry{lruIter, 0, fileSize});
-  auto iter = fileIndex_.emplace(file, std::move(entry)).first;
-  lru_.front() = iter;
+  if (lru_.size() >= hotLruLimit_) {
+    uint32_t idx = static_cast<uint32_t>(cold_.size());
+    auto nodeIt = coldIndex_.emplace(file, idx);
+    cold_.emplace_back(nodeIt.first, fileSize, photon::now);
+  } else {
+    auto lruIter = lru_.push_front(fileIndex_.end());
+    auto entry = std::unique_ptr<LruEntry>(new LruEntry{lruIter, 0, fileSize});
+    auto iter = fileIndex_.emplace(file, std::move(entry)).first;
+    lru_.front() = iter;
+  }
   totalUsed_ += fileSize;
   return 0;
 }
@@ -368,7 +367,7 @@ void FileCachePool::demoteToCold(FileNameMap::iterator iter) {
 
   uint32_t idx = static_cast<uint32_t>(cold_.size());
   auto nodeIt = coldIndex_.emplace(iter->first, idx);
-  cold_.emplace_back(nodeIt.first, lruEntry->size);
+  cold_.emplace_back(nodeIt.first, lruEntry->size, photon::now);
 
   lru_.remove(lruEntry->lruIter);
   fileIndex_.erase(iter);
@@ -386,43 +385,71 @@ void FileCachePool::promoteToHot(ColdIndexMap::iterator iter) {
   auto newIter = fileIndex_.emplace(filename, std::move(entry)).first;
   lru_.front() = newIter;
 
-  removeColdEntry(idx);
+  coldIndex_.erase(iter);
+  // swap-remove
+  if (idx + 1 < cold_.size()) {
+    std::swap(cold_[idx], cold_.back());
+    cold_[idx].iter->second = idx;
+  }
+  cold_.pop_back();
 }
 
-// Evict the cold entry at coldIndex.
-bool FileCachePool::evictColdEntry(uint32_t coldIndex) {
-  std::string_view filename = cold_[coldIndex].iter->first;
-  uint64_t fileSize = cold_[coldIndex].size;
-
-  DEFER(removeColdEntry(coldIndex));
+// Evict the cold entry at coldIndex and return the evicted file size.
+ssize_t FileCachePool::evictColdByIndex(uint32_t idx) {
+  assert(idx < cold_.size());
+  auto &entry = cold_[idx];
+  std::string_view filename = entry.iter->first;
+  uint64_t fileSize = entry.size;
 
   if (fileSize > 0) {
-    totalUsed_ -= static_cast<int64_t>(fileSize);
-    if (totalUsed_ < 0) totalUsed_ = 0;
     int err = mediaFs_->truncate(filename.data(), 0);
     if (err) {
       ERRNO e;
-      LOG_ERROR("truncate(0) failed (cold), name : `, error code : `", filename, e);
+      LOG_ERRNO_RETURN(0, -1, "truncate(0) failed, name : `", filename);
     }
+    totalUsed_ -= static_cast<int64_t>(fileSize);
+    entry.size = 0;
+    if (totalUsed_ < 0) totalUsed_ = 0;
   }
   int err = mediaFs_->unlink(filename.data());
   if (err) {
     ERRNO e;
-    LOG_ERROR("unlink failed (cold), name : `, error code : `", filename, e);
+    LOG_ERRNO_RETURN(0, -1, "unlink failed, name : `", filename);
   }
-  return err == 0;
-}
 
-// Remove the cold entry at coldIndex via swap-remove.
-void FileCachePool::removeColdEntry(uint32_t coldIndex) {
-  auto nodeIt = cold_[coldIndex].iter;
-  coldIndex_.erase(nodeIt);
-  // swap-remove
-  if (coldIndex + 1 < cold_.size()) {
-    cold_[coldIndex] = cold_.back();
-    cold_[coldIndex].iter->second = coldIndex;
+  coldIndex_.erase(entry.iter);
+  if (idx + 1 < cold_.size()) {
+    std::swap(cold_[idx], cold_.back());
+    cold_[idx].iter->second = idx;
   }
   cold_.pop_back();
+  return fileSize;
+}
+
+uint64_t FileCachePool::evictColdWhenFull(uint64_t needEvict) {
+  uint64_t evictSize = 0;
+  while (evictSize < needEvict && !cold_.empty() && !exit_) {
+    uint32_t sz = cold_.size();
+    // Fixed candidates: head (0) and tail (sz-1), plus up to 5 random indices.
+    static const int kMaxCandidates = 7;
+    uint32_t old = 0;
+    uint64_t oldTime = cold_[old].demoteTime;
+    if (cold_.back().demoteTime < oldTime) {
+      old = sz - 1;
+      oldTime = cold_[old].demoteTime;
+    }
+    for (int k = 2; k < kMaxCandidates; k++) {
+      uint32_t candidate = rand() % sz;
+      if (cold_[candidate].demoteTime < oldTime) {
+        old = candidate;
+        oldTime = cold_[old].demoteTime;
+      }
+    }
+    auto r = evictColdByIndex(old);
+    if (r >= 0) evictSize += r;
+    photon::thread_yield();
+  }
+  return evictSize;
 }
 
 }

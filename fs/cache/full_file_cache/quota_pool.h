@@ -78,6 +78,24 @@ protected:
       uint32_t QuotaLruIter;
       DirMap::iterator dir;
     };
+
+private:
+    void demoteToCold(FileNameMap::iterator iter) override;
+    void promoteToHot(ColdIndexMap::iterator iter) override;
+    uint64_t evictColdWhenFull(uint64_t needEvict) override;
+    ssize_t evictColdByIndex(uint32_t idx) override;
+
+    struct QuotaColdEntry {
+        QuotaColdEntry(ColdIndexMap::iterator iter, uint64_t size, uint64_t demoteTime,
+                       uint32_t dirLruIter)
+            : iter(iter), size(size), demoteTime(demoteTime), dirLruIter(dirLruIter) {}
+        ColdIndexMap::iterator iter;
+        uint64_t size;
+        uint64_t demoteTime;
+        uint32_t dirLruIter;  // Points to position in dir->lru
+        std::string_view filename() const { return iter->first; }
+    };
+    std::vector<QuotaColdEntry> quotaCold_;
 };
 
 }

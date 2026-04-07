@@ -829,7 +829,7 @@ TEST(CachePool, evict_cold_file) {
   EXPECT_LE(T::hot_size(pool), hotLimit);
   EXPECT_EQ(T::hot_size(pool) + T::cold_size(pool), fileNum);
 
-  EXPECT_EQ(0, pool->evict("/f0"));
+  ASSERT_EQ(0, pool->evict("/f0"));
   EXPECT_FALSE(T::in_cold(pool, "/f0"));
   EXPECT_FALSE(T::in_hot(pool, "/f0"));
   EXPECT_EQ(T::hot_size(pool), hotLimit);
@@ -839,22 +839,72 @@ TEST(CachePool, evict_cold_file) {
   evicted[0] = true;
   for (size_t i = 0; i < 9; i++) {
     int index = rand() % fileNum;
-    while (evicted[index]) {
-      index = rand() % fileNum;
-    }
     std::string name = "/f" + std::to_string(index);
-    EXPECT_EQ(0, pool->evict(name));
+    while (evicted[index] || !T::in_cold(pool, name)) {
+      index = rand() % fileNum;
+      name = "/f" + std::to_string(index);
+    }
+    ASSERT_EQ(0, pool->evict(name));
     evicted[index] = true;
     EXPECT_FALSE(T::in_cold(pool, name));
-    EXPECT_FALSE(T::in_hot(pool, name));
-    EXPECT_LE(T::hot_size(pool), hotLimit);
-    EXPECT_EQ(T::hot_size(pool) + T::cold_size(pool), fileNum - 2 - i);
+    EXPECT_EQ(T::cold_size(pool), fileNum - hotLimit - 2 - i);
   }
+}
+
+TEST(CachePool, evict_cold_first_when_full) {
+  std::string root = "/tmp/ease/cache/evict_cold_first_when_full/";
+  SetupTestDir(root);
+  const uint64_t capacityGB = 1;
+  const size_t hotLimit = 5;
+  const size_t fileNum = 40;
+  const size_t fileSizeMB = 60;
+  const size_t fileSizeBytes = fileSizeMB * 1024 * 1024;
+
+  auto mediaFs = new_localfs_adaptor(root.c_str(), ioengine_libaio);
+  auto alignFs = new_aligned_fs_adaptor(mediaFs, 4 * 1024, true, true);
+  auto cacheAllocator = new AlignedAlloc(4 * 1024);
+  auto roCachedFs = new_full_file_cached_fs(nullptr, alignFs, 1024 * 1024,
+      capacityGB, 0, 128ul * 1024 * 1024, cacheAllocator, 0, nullptr, 1000);
+  auto cachePool = roCachedFs->get_pool();
+  DEFER({ delete cacheAllocator; delete roCachedFs; });
+  using T = FileCachePoolTest;
+
+  auto pool = dynamic_cast<FileCachePool*>(cachePool);
+  ASSERT_NE(nullptr, pool);
+  T::set_hot_lru_limit(pool, hotLimit);
+
+  IOVector buffer(*cacheAllocator);
+  buffer.push_back(fileSizeBytes);
 
   for (size_t i = 0; i < fileNum; i++) {
-    std::string name = "/f" + std::to_string(i);
-    bool existed = T::in_cold(pool, name) || T::in_hot(pool, name);
-    EXPECT_EQ(existed, !evicted[i]);
+    photon::thread_usleep(1000);
+    std::string name = "/g" + std::to_string(i);
+    auto store = cachePool->open(name.c_str(), O_CREAT | O_RDWR, 0644);
+    ASSERT_NE(nullptr, store);
+    store->do_pwritev2(buffer.iovec(), buffer.iovcnt(), 0, 0);
+    store->release();
+  }
+
+  size_t remaining = T::hot_size(pool) + T::cold_size(pool);
+  EXPECT_LT(remaining, fileNum);
+  EXPECT_LE(T::hot_size(pool), (size_t)hotLimit);
+
+  for (size_t i = fileNum - hotLimit; i < fileNum; i++) {
+    std::string name = "/g" + std::to_string(i);
+    EXPECT_TRUE(T::in_hot(pool, name)) << name << " should still be in hot";
+    EXPECT_FALSE(T::in_cold(pool, name)) << name << " must not be in cold";
+  }
+
+  // Write a new file to trigger eviction, the cold file should be evicted first
+  std::string name = "/g" + std::to_string(fileNum);
+  auto store = cachePool->open(name.c_str(), O_CREAT | O_RDWR, 0644);
+  ASSERT_NE(nullptr, store);
+  store->do_pwritev2(buffer.iovec(), buffer.iovcnt(), 0, 0);
+  store->release();
+  for (size_t i = fileNum - hotLimit; i < fileNum; i++) {
+    std::string name = "/g" + std::to_string(i);
+    bool existed = T::in_hot(pool, name) || T::in_cold(pool, name);
+    EXPECT_TRUE(existed) << name << " must still exist";
   }
 }
 

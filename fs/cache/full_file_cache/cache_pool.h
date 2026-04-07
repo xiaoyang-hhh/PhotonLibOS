@@ -35,7 +35,7 @@ namespace fs {
 class FileCachePool : public photon::fs::ICachePool {
 public:
     FileCachePool(photon::fs::IFileSystem *mediaFs, uint64_t capacityInGB, uint64_t periodInUs,
-                  uint64_t diskAvailInBytes, uint64_t refillUnit,
+                  uint64_t diskAvailInBytes, uint64_t refillUnit, 
                   uint64_t storeCacheTTLUsecs = 10'000'000);
     ~FileCachePool();
 
@@ -117,19 +117,20 @@ protected:
     // If hotLruLimit_ is reached, files are demoted to cold container.
     using ColdIndexMap = unordered_map_string_key<uint32_t>;
     struct ColdEntry {
-        ColdEntry(ColdIndexMap::iterator iter, uint64_t size)
-            : iter(iter), size(size) {}
-        ColdIndexMap::iterator iter;  // stable; points into coldIndex_ node
+        ColdEntry(ColdIndexMap::iterator iter, uint64_t size, uint64_t demoteTime)
+            : iter(iter), size(size), demoteTime(demoteTime) {}
+        ColdIndexMap::iterator iter;
         uint64_t size;
+        uint64_t demoteTime; // seconds when demoted to cold
         std::string_view filename() const { return iter->first; }
     };
     std::vector<ColdEntry> cold_;
     ColdIndexMap coldIndex_;
 
-    void demoteToCold(FileNameMap::iterator iter);
-    void promoteToHot(ColdIndexMap::iterator iter);
-    void removeColdEntry(uint32_t coldIndex);
-    bool evictColdEntry(uint32_t coldIndex);
+    virtual void demoteToCold(FileNameMap::iterator iter);
+    virtual void promoteToHot(ColdIndexMap::iterator iter);
+    virtual uint64_t evictColdWhenFull(uint64_t needEvict);
+    virtual ssize_t evictColdByIndex(uint32_t idx);
 
     friend struct FileCachePoolTest;
 };

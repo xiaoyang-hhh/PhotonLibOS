@@ -61,6 +61,12 @@ ICacheStore* QuotaFilePool::do_open(std::string_view pathname, int flags, mode_t
   std::string dirName(pathname.data() + 1, pos);
   auto dir = dirInfos_.find(dirName);
 
+  // Check cold container first
+  auto coldIt = coldIndex_.find(pathname);
+  if (coldIt != coldIndex_.end()) {
+    promoteToHot(coldIt);
+  }
+
   auto find = fileIndex_.find(pathname);
   if (find == fileIndex_.end()) {
     find = insertNewFile(dir, std::move(dirName), pathname).first;
@@ -71,6 +77,16 @@ ICacheStore* QuotaFilePool::do_open(std::string_view pathname, int flags, mode_t
     auto lruEntry = static_cast<QuotaLruEntry*>(find->second.get());
     dir->second.lru.access(lruEntry->QuotaLruIter);
     find->second->openCount++;
+  }
+
+  // If hot LRU exceeds the limit, demote the LRU tail (only if not open) to cold
+  while (lru_.size() > hotLruLimit_) {
+    auto tailIter = lru_.back();
+    if (tailIter->second->openCount == 0) {
+      demoteToCold(tailIter);
+    } else {
+      break;
+    }
   }
 
   return new QuotaFileStore(this, localFile, refillUnit_, find);
@@ -179,6 +195,12 @@ int QuotaFilePool::stat(CacheStat* stat, std::string_view pathname) {
 }
 
 int QuotaFilePool::evict(std::string_view filename) {
+  // Check cold container first — cold files are not in fileIndex_
+  auto coldIt = coldIndex_.find(filename);
+  if (coldIt != coldIndex_.end()) {
+    return evictColdByIndex(coldIt->second) >= 0 ? 0 : -1;
+  }
+
   auto pos = getQuotaCtrlPos(filename.data());
   std::string dirName(filename.data() + 1, pos);
   auto find = dirInfos_.find(dirName.c_str());
@@ -195,9 +217,9 @@ int QuotaFilePool::evict(std::string_view filename) {
   int err;
   auto lruEntry = static_cast<QuotaLruEntry*>(fileIter->second.get());
 
-  auto cacheStore = static_cast<FileCacheStore*>(open(filePath, O_RDWR, 0644));
-  DEFER(cacheStore->release());
   {
+    auto cacheStore = static_cast<FileCacheStore*>(open(filePath, O_RDWR, 0644));
+    DEFER(cacheStore->release());
     photon::scoped_rwlock rl(cacheStore->rw_lock(), photon::WLOCK);
     lru.mark_key_cleared(lruEntry->QuotaLruIter);
     err = mediaFs_->truncate(filePath.data(), 0);
@@ -238,9 +260,9 @@ void QuotaFilePool::dirEviction() {
       int err;
       bool flags_dir_delete = false;
 
-      auto cacheStore = static_cast<FileCacheStore*>(open(fileName, O_RDWR, 0644));
-      DEFER(cacheStore->release());
       {
+        auto cacheStore = static_cast<FileCacheStore*>(open(fileName, O_RDWR, 0644));
+        DEFER(cacheStore->release());
         photon::scoped_rwlock rl(cacheStore->rw_lock(), photon::WLOCK);
         if (lruEntry->openCount==0){
           dir->lru.mark_key_cleared(lruEntry->QuotaLruIter);
@@ -335,6 +357,146 @@ int QuotaFilePool::insertFile(std::string_view file) {
   dir->second.used += fileSize;
   totalUsed_ += fileSize;
   return 0;
+}
+
+// Demote a hot-LRU entry to cold container.
+// Keep file in dir LRU for accurate dir eviction and stats.
+// Store dir LRU iterator in quotaCold_ to avoid linear search during promote/evict.
+void QuotaFilePool::demoteToCold(FileNameMap::iterator iter) {
+  auto lruEntry = static_cast<QuotaLruEntry*>(iter->second.get());
+  auto& dirInfo = lruEntry->dir->second;
+
+  // Get the iterator to the file in dir LRU before we lose access to lruEntry
+  auto dirLruIter = lruEntry->QuotaLruIter;
+
+  // Add to quota cold container with demoteTime and dir LRU iterator
+  uint32_t idx = static_cast<uint32_t>(quotaCold_.size());
+  auto nodeIt = coldIndex_.emplace(iter->first, idx);
+  quotaCold_.emplace_back(nodeIt.first, lruEntry->size, photon::now, dirLruIter);
+
+  // Only remove from global hot LRU, keep in dir LRU
+  lru_.remove(lruEntry->lruIter);
+  // Note: dir->lru and fileCount are kept for dir eviction to work correctly
+
+  // Remove from fileIndex_
+  fileIndex_.erase(iter);
+}
+
+// Promote a cold entry back to hot LRU.
+// Use saved dir LRU iterator from quotaCold_ to avoid linear search.
+void QuotaFilePool::promoteToHot(ColdIndexMap::iterator iter) {
+  uint32_t idx = iter->second;
+  uint64_t size = quotaCold_[idx].size;
+  std::string_view filename = iter->first;
+  auto dirLruIter = quotaCold_[idx].dirLruIter;
+
+  auto pos = getQuotaCtrlPos(filename.data());
+  if (!pos) {
+    LOG_ERROR_RETURN(EINVAL, void(), "filename don't contain dir name:`", filename);
+  }
+  std::string dirName(filename.data() + 1, pos);
+  auto dirIt = dirInfos_.find(dirName);
+  if (dirIt == dirInfos_.end()) {
+    LOG_ERROR_RETURN(EINVAL, void(), "dir not found during promote, filename: `", filename);
+  }
+
+  // Reuse existing quotaLruIter, only add to global hot LRU
+  auto lruIter = lru_.push_front(fileIndex_.end());
+  std::unique_ptr<QuotaLruEntry> entry(new QuotaLruEntry{lruIter, 0, dirLruIter, size, dirIt});
+  auto newIter = fileIndex_.emplace(filename, std::move(entry)).first;
+  lru_.front() = newIter;
+  // Note: dir->lru and fileCount are kept unchanged
+
+  // Remove from cold container using swap-remove
+  coldIndex_.erase(iter);
+  if (idx + 1 < quotaCold_.size()) {
+    std::swap(quotaCold_[idx], quotaCold_.back());
+    quotaCold_[idx].iter->second = idx;
+  }
+  quotaCold_.pop_back();
+}
+
+// Evict a cold entry by index.
+// Use saved dir LRU iterator from quotaCold_ to avoid linear search.
+// Returns the evicted file size, or -1 on error.
+ssize_t QuotaFilePool::evictColdByIndex(uint32_t idx) {
+  assert(idx < quotaCold_.size());
+  auto &entry = quotaCold_[idx];
+  std::string_view filename = entry.iter->first;
+  uint64_t fileSize = entry.size;
+  auto dirLruIter = entry.dirLruIter;
+
+  auto pos = getQuotaCtrlPos(filename.data());
+  if (!pos) {
+    LOG_ERROR_RETURN(EINVAL, -1, "filename don't contain dir name:`", filename);
+  }
+  std::string dirName(filename.data() + 1, pos);
+  auto dirIt = dirInfos_.find(dirName);
+  if (dirIt == dirInfos_.end()) {
+    LOG_ERROR_RETURN(EINVAL, -1, "dir not found during promote, filename: `", filename);
+  }
+
+  if (dirIt != dirInfos_.end()) {
+    auto& dirInfo = dirIt->second;
+    // Remove from dir LRU using saved iterator - O(1)!
+    dirInfo.lru.remove(dirLruIter);
+    dirInfo.fileCount--;
+    dirInfo.used -= static_cast<int64_t>(fileSize);
+    if (dirInfo.used < 0) dirInfo.used = 0;
+  }
+
+  if (fileSize > 0) {
+    int err = mediaFs_->truncate(filename.data(), 0);
+    if (err) {
+      ERRNO e;
+      LOG_ERRNO_RETURN(0, -1, "truncate(0) failed (cold), name : `", filename);
+    }
+    totalUsed_ -= static_cast<int64_t>(fileSize);
+    entry.size = 0;
+    if (totalUsed_ < 0) totalUsed_ = 0;
+  }
+  int err = mediaFs_->unlink(filename.data());
+  if (err) {
+    ERRNO e;
+    LOG_ERRNO_RETURN(0, -1, "unlink failed (cold), name : `", filename);
+  }
+
+  // Remove from cold container using swap-remove
+  coldIndex_.erase(entry.iter);
+  if (idx + 1 < quotaCold_.size()) {
+    std::swap(quotaCold_[idx], quotaCold_.back());
+    quotaCold_[idx].iter->second = idx;
+  }
+  quotaCold_.pop_back();
+  return static_cast<ssize_t>(fileSize);
+}
+
+// Evict cold entries until needEvict bytes are freed.
+// Uses sampling to find the oldest cold entries.
+uint64_t QuotaFilePool::evictColdWhenFull(uint64_t needEvict) {
+  uint64_t evictSize = 0;
+  while (evictSize < needEvict && !quotaCold_.empty() && !exit_) {
+    uint32_t sz = quotaCold_.size();
+    // Fixed candidates: head (0) and tail (sz-1), plus up to 5 random indices.
+    static const int kMaxCandidates = 7;
+    uint32_t old = 0;
+    uint64_t oldTime = quotaCold_[old].demoteTime;
+    if (quotaCold_.back().demoteTime < oldTime) {
+      old = sz - 1;
+      oldTime = quotaCold_[old].demoteTime;
+    }
+    for (int k = 2; k < kMaxCandidates; k++) {
+      uint32_t candidate = rand() % sz;
+      if (quotaCold_[candidate].demoteTime < oldTime) {
+        old = candidate;
+        oldTime = quotaCold_[old].demoteTime;
+      }
+    }
+    auto r = evictColdByIndex(old);
+    if (r >= 0) evictSize += r;
+    photon::thread_yield();
+  }
+  return evictSize;
 }
 
 }
