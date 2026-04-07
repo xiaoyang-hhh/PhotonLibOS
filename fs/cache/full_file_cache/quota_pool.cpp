@@ -364,7 +364,6 @@ int QuotaFilePool::insertFile(std::string_view file) {
 // Store dir LRU iterator in quotaCold_ to avoid linear search during promote/evict.
 void QuotaFilePool::demoteToCold(FileNameMap::iterator iter) {
   auto lruEntry = static_cast<QuotaLruEntry*>(iter->second.get());
-  auto& dirInfo = lruEntry->dir->second;
 
   // Get the iterator to the file in dir LRU before we lose access to lruEntry
   auto dirLruIter = lruEntry->QuotaLruIter;
