@@ -79,10 +79,10 @@ ICacheStore* FileCachePool::do_open(std::string_view pathname, int flags, mode_t
     return nullptr;
   }
 
-  // Check idle container first
-  auto idleIt = idleFileIndex_.find(pathname);
-  if (idleIt != idleFileIndex_.end()) {
-    promoteFromIdle(idleIt);
+  // Check inactive container first
+  auto inactiveIt = inactiveFileIndex_.find(pathname);
+  if (inactiveIt != inactiveFileIndex_.end()) {
+    promoteFromInactive(inactiveIt);
   }
 
   auto find = fileIndex_.find(pathname);
@@ -96,11 +96,11 @@ ICacheStore* FileCachePool::do_open(std::string_view pathname, int flags, mode_t
     find->second->openCount++;
   }
 
-  // If LRU exceeds the limit, demote the tail (only if not open) to idle
+  // If LRU exceeds the limit, demote the tail (only if not open) to inactive
   while (lru_.size() > demoteThreshold_) {
     auto tailIt = lru_.back();
     if (tailIt->second->openCount == 0) {
-      demoteToIdle(tailIt);
+      demoteToInactive(tailIt);
     } else {
       break;
     }
@@ -139,10 +139,10 @@ int FileCachePool::stat(CacheStat* stat, std::string_view pathname) {
 }
 
 int FileCachePool::evict(std::string_view filename) {
-  // Check idle container first
-  auto idleIt = idleFileIndex_.find(filename);
-  if (idleIt != idleFileIndex_.end()) {
-    return evictIdleEntry(idleIt) >= 0 ? 0 : -1;
+  // Check inactive container first
+  auto inactiveIt = inactiveFileIndex_.find(filename);
+  if (inactiveIt != inactiveFileIndex_.end()) {
+    return evictInactiveEntry(inactiveIt) >= 0 ? 0 : -1;
   }
 
   auto fileIter = fileIndex_.find(filename);
@@ -262,10 +262,10 @@ void FileCachePool::eviction() {
 
   isFull_ = true;
 
-  // Phase 1: evict from idle tier first.
-  actualEvict -= evictIdleWhenFull(actualEvict);
+  // Phase 1: evict from inactive tier first.
+  actualEvict -= evictInactiveWhenFull(actualEvict);
 
-  // Phase 2: fall back to LRU eviction when idle tier is exhausted
+  // Phase 2: fall back to LRU eviction when inactive tier is exhausted
   while (actualEvict > 0 && !lru_.empty() && !exit_) {
     auto fileIter = lru_.back();
     const auto& fileName = fileIter->first;
@@ -348,9 +348,9 @@ int FileCachePool::insertFile(std::string_view file) {
   auto fileSize = st.st_blocks * kDiskBlockSize;
 
   if (lru_.size() >= demoteThreshold_) {
-    auto idleLruIt = idleLru_.push_front(idleFileIndex_.end());
-    auto iter = idleFileIndex_.emplace(file, idleLruIt).first;
-    idleLru_.front() = iter;
+    auto inactiveLruIt = inactiveLru_.push_front(inactiveFileIndex_.end());
+    auto iter = inactiveFileIndex_.emplace(file, inactiveLruIt).first;
+    inactiveLru_.front() = iter;
   } else {
     auto lruIter = lru_.push_front(fileIndex_.end());
     auto entry = std::unique_ptr<LruEntry>(new LruEntry{lruIter, 0, fileSize});
@@ -361,20 +361,20 @@ int FileCachePool::insertFile(std::string_view file) {
   return 0;
 }
 
-// Demote a LRU entry (openCount must be 0) to the idle container.
-void FileCachePool::demoteToIdle(FileNameMap::iterator iter) {
-  auto idleLruIt = idleLru_.push_front(idleFileIndex_.end());
-  auto idleIndexIt = idleFileIndex_.emplace(iter->first, idleLruIt).first;
-  idleLru_.front() = idleIndexIt;
+// Demote a LRU entry (openCount must be 0) to the inactive container.
+void FileCachePool::demoteToInactive(FileNameMap::iterator iter) {
+  auto inactiveLruIt = inactiveLru_.push_front(inactiveFileIndex_.end());
+  auto inactiveIndexIt = inactiveFileIndex_.emplace(iter->first, inactiveLruIt).first;
+  inactiveLru_.front() = inactiveIndexIt;
 
   lru_.remove(iter->second->lruIter);
   fileIndex_.erase(iter);
 }
 
-// Promote an idle entry back to the front of LRU.
-void FileCachePool::promoteFromIdle(IdleFileNameMap::iterator idleIt) {
-  uint32_t idleLruIter = idleIt->second;
-  const auto& filename = idleIt->first;
+// Promote an inactive entry back to the front of LRU.
+void FileCachePool::promoteFromInactive(InactiveFileNameMap::iterator inactiveIt) {
+  uint32_t inactiveLruIter = inactiveIt->second;
+  const auto& filename = inactiveIt->first;
 
   struct stat st = {};
   uint64_t fileSize = 0;
@@ -387,13 +387,13 @@ void FileCachePool::promoteFromIdle(IdleFileNameMap::iterator idleIt) {
   auto iter = fileIndex_.emplace(filename, std::move(entry)).first;
   lru_.front() = iter;
 
-  idleLru_.remove(idleLruIter);
-  idleFileIndex_.erase(idleIt);
+  inactiveLru_.remove(inactiveLruIter);
+  inactiveFileIndex_.erase(inactiveIt);
 }
 
-// Evict the idle entry pointed to by idleIt; return freed bytes or -1 on error.
-ssize_t FileCachePool::evictIdleEntry(IdleFileNameMap::iterator idleIt) {
-  const auto& filename = idleIt->first;
+// Evict the inactive entry pointed to by inactiveIt; return freed bytes or -1 on error.
+ssize_t FileCachePool::evictInactiveEntry(InactiveFileNameMap::iterator inactiveIt) {
+  const auto& filename = inactiveIt->first;
 
   struct stat st = {};
   uint64_t fileSize = 0;
@@ -415,16 +415,16 @@ ssize_t FileCachePool::evictIdleEntry(IdleFileNameMap::iterator idleIt) {
     LOG_ERRNO_RETURN(0, fileSize, "unlink failed, name : `", filename);
   }
 
-  uint32_t idleLruIter = idleIt->second;
-  idleLru_.remove(idleLruIter);
-  idleFileIndex_.erase(idleIt);
+  uint32_t inactiveLruIter = inactiveIt->second;
+  inactiveLru_.remove(inactiveLruIter);
+  inactiveFileIndex_.erase(inactiveIt);
   return static_cast<ssize_t>(fileSize);
 }
 
-uint64_t FileCachePool::evictIdleWhenFull(uint64_t needEvict) {
+uint64_t FileCachePool::evictInactiveWhenFull(uint64_t needEvict) {
   uint64_t evictSize = 0;
-  while (evictSize < needEvict && !idleLru_.empty() && !exit_) {
-    auto r = evictIdleEntry(idleLru_.back());
+  while (evictSize < needEvict && !inactiveLru_.empty() && !exit_) {
+    auto r = evictInactiveEntry(inactiveLru_.back());
     if (r >= 0) evictSize += static_cast<uint64_t>(r);
     photon::thread_yield();
   }
