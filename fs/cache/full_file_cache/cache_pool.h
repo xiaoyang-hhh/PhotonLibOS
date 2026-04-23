@@ -32,6 +32,49 @@ limitations under the License.
 namespace photon {
 namespace fs {
 
+// Abstract base for cold (non-hot) cache tiers.
+class ColdCacheTier {
+public:
+    virtual ~ColdCacheTier() = default;
+    virtual bool contains(std::string_view name) = 0;
+    virtual void remove(std::string_view name) = 0;
+    virtual void insert(std::string_view name) = 0;
+    virtual size_t size() = 0;
+    virtual bool empty() = 0;
+    // The returned view is valid until remove().
+    virtual std::string_view victim() = 0;
+};
+
+class InactiveCacheTier : public ColdCacheTier {
+public:
+    typedef map_string_key<uint32_t> IndexMap;
+    typedef photon::fs::LRU<IndexMap::iterator, uint32_t> LRUContainer;
+
+    bool contains(std::string_view name) override;
+    void remove(std::string_view name) override;
+    void insert(std::string_view name) override;
+    size_t size() override;
+    bool empty() override;
+    std::string_view victim() override;
+
+private:
+    LRUContainer lru_;
+    IndexMap index_;
+};
+
+class IdleCacheTier : public ColdCacheTier {
+public:
+    bool contains(std::string_view name) override;
+    void remove(std::string_view name) override;
+    void insert(std::string_view name) override;
+    size_t size() override;
+    bool empty() override;
+    std::string_view victim() override;
+
+private:
+    std::unordered_set<std::string> index_;
+};
+
 class FileCachePool : public photon::fs::ICachePool {
 public:
     FileCachePool(photon::fs::IFileSystem *mediaFs, uint64_t capacityInGB, uint64_t periodInUs,
@@ -42,8 +85,6 @@ public:
     static const uint64_t kDiskBlockSize = 512; // stat(2)
     static const uint64_t kDeleteDelayInUs = 1000;
     static const uint32_t kWaterMarkRatio = 90;
-    // max inuse-lru entries before demoting tail to inactive-lru (default: 100w)
-    static const uint32_t kDemoteThreshold = 1'000'000;
 
     void Init();
 
@@ -112,19 +153,21 @@ protected:
     // filename -> lruEntry
     FileNameMap fileIndex_;
 
-    uint32_t demoteThreshold_ = kDemoteThreshold;
+    // Cold tiers: inactive (LRU-ordered) and idle (unordered).
+    // Eviction/promote cascades iterate coldTiers_ in order.
+    InactiveCacheTier inactiveTier_;
+    IdleCacheTier idleTier_;
+    std::vector<ColdCacheTier*> coldTiers_ = {&inactiveTier_, &idleTier_};
 
-    // inactiveFileIndex_ stores filename -> lruContainer's iterator
-    // inactiveLru_ stores iterators into inactiveFileIndex_; std::map nodes are stable.
-    typedef map_string_key<uint32_t> InactiveFileNameMap;
-    typedef photon::fs::LRU<InactiveFileNameMap::iterator, uint32_t> InactiveLRUContainer;
-    InactiveLRUContainer inactiveLru_;
-    InactiveFileNameMap inactiveFileIndex_;
+    // Demote thresholds: max entries before demoting tail to the next tier.
+    // thresholds_[0] = active → inactive, thresholds_[1] = inactive → idle.
+    static constexpr uint32_t kDefaultThresholds[] = {100'000, 100'000'000};
+    std::vector<uint32_t> thresholds_ = {kDefaultThresholds[0], kDefaultThresholds[1]};
 
-    void demoteToInactive(FileNameMap::iterator iter);
-    void promoteFromInactive(InactiveFileNameMap::iterator inactiveIter);
-    uint64_t evictInactiveWhenFull(uint64_t needEvictSize);
-    ssize_t evictInactiveEntry(InactiveFileNameMap::iterator inactiveIter);
+    void demoteToCold();
+
+    void promoteToHot(std::string_view filename);
+    ssize_t truncateAndUnlink(std::string_view filename);
 
     friend struct FileCachePoolTest;
 };
