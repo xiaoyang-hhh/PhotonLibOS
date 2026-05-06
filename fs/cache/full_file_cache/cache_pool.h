@@ -20,7 +20,6 @@ limitations under the License.
 #include <map>
 #include <memory>
 #include <string>
-#include <unordered_set>
 #include <vector>
 #include <photon/thread/thread.h>
 #include <photon/thread/timer.h>
@@ -73,7 +72,7 @@ public:
     std::string_view victim() override;
 
 private:
-    std::unordered_set<std::string> index_;
+    unordered_set_string_key<> index_;
 };
 
 class FileCachePool : public photon::fs::ICachePool {
