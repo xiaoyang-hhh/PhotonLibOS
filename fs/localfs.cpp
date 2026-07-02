@@ -120,6 +120,10 @@ namespace fs
         {
             return fdatasync();
         }
+        virtual off_t lseek(off_t offset, int whence) override
+        {
+            return UISysCall(::lseek(fd, offset, whence));
+        }
 #ifdef __linux__
         virtual int fiemap(struct fiemap* map) override
         {
@@ -178,11 +182,6 @@ namespace fs
     {
     public:
         using BaseFileAdaptor::BaseFileAdaptor;
-        virtual off_t lseek(off_t offset, int whence) override
-        {
-            return UISysCall(::lseek(fd, offset, whence));
-        }
-
         virtual int fsync() override
         {
             thread_yield();

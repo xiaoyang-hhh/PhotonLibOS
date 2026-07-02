@@ -182,6 +182,8 @@ namespace fs
         virtual int fdatasync() { errno = ENOSYS; return -1; }
         virtual int close() { return 0; }
 
+        virtual IFile* get_media_file() { return nullptr; }
+
         void release(bool detach = false)
         {
             bool should_delete = false;

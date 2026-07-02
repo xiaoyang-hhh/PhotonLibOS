@@ -50,6 +50,8 @@ public:
 
     int fstat(struct stat *buf) override;
 
+    IFile* get_media_file() override { return localFile_; }
+
     photon::rwlock &rw_lock() { return rw_lock_; }
 
     bool isFiemapUnavailable() const { return !fiemapSupported_; }
